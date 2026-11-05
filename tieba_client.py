@@ -3,6 +3,7 @@ import logging
 import random
 import time
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 
@@ -132,7 +133,8 @@ class TiebaClient:
         if result is None:
             logger.error("获取 tbs 失败")
             return None
-        self.logged_in = result.get("is_login") == "1"
+        # 修复：接口返回的 is_login 是数字 1，原代码误与字符串 "1" 比较，导致误报
+        self.logged_in = str(result.get("is_login")) == "1"
         if not self.logged_in:
             logger.warning("BDUSS 登录状态异常: is_login=%s", result.get("is_login"))
         return result.get("tbs", "")
@@ -224,6 +226,10 @@ class TiebaClient:
         """
         web 端签到兜底。当客户端接口返回 retryable / 部分 fatal 时，
         使用 STOKEN Cookie 尝试 web 端 `sign/add`。
+
+        修复：原代码把中文吧名直接拼进 Referer 请求头，
+        导致 latin-1 编码报错，web 兜底对所有中文吧名必然失败。
+        现在对 kw 做 URL 编码（percent-encoding），请求头合法且服务端等效解析。
         """
         if not self.stoken:
             return {"status": "fatal", "rank": None, "message": "无 STOKEN，无法使用 web 兜底"}
@@ -233,7 +239,7 @@ class TiebaClient:
             "kw": kw,
             "tbs": tbs,
         }
-        headers = {"Referer": f"https://tieba.baidu.com/f?kw={kw}&fr=home"}
+        headers = {"Referer": f"https://tieba.baidu.com/f?kw={quote(kw)}&fr=home"}
 
         result = self._request(WEB_SIGN_URL, "post", data, headers=headers)
         if result is None:
