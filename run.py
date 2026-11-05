@@ -31,6 +31,7 @@ MAX_ROUNDS = 5
 
 def slow_sleeper(event: str, idx: int, total: int) -> None:
     """放慢版节流策略，防风控。
+
     单吧间隔 3-5 秒，每 10 个吧歇 15-25 秒。
     500 个吧约 40-50 分钟跑完，凌晨跑完全来得及。
     """
@@ -49,6 +50,7 @@ def slow_sleeper(event: str, idx: int, total: int) -> None:
 
 def run_signin(client: TiebaClient, tbs: str, forums: list, max_rounds: int = MAX_ROUNDS,
                sleeper=None) -> dict:
+    """多轮签到主循环。"""
     if sleeper is None:
         sleeper = slow_sleeper
 
@@ -57,6 +59,7 @@ def run_signin(client: TiebaClient, tbs: str, forums: list, max_rounds: int = MA
 
     for round_idx in range(max_rounds):
         if round_idx > 0:
+            # 每轮重试前刷新 tbs，避免旧 tbs 导致验证失败
             new_tbs = client.get_tbs()
             if new_tbs is None:
                 logger.error("轮间刷新 tbs 失败，剩余贴吧全部标记失败")
@@ -100,6 +103,7 @@ def run_signin(client: TiebaClient, tbs: str, forums: list, max_rounds: int = MA
 
 
 def build_summary(stats: dict, total: int) -> str:
+    """生成单个账号的签到汇总。"""
     lines = [
         f"贴吧总数: {total}",
         f"✅ 签到成功: {len(stats['success'])}",
@@ -107,7 +111,7 @@ def build_summary(stats: dict, total: int) -> str:
         f"❌ 签到失败: {len(stats['failed'])}",
     ]
     if stats["failed"]:
-        lines.append("失败贴吧（多为被封的吧）:")
+        lines.append("失败贴吧（多为被封的吧，属正常）:")
         lines.extend(f"  - {n}" for n in stats["failed"][:30])
         if len(stats["failed"]) > 30:
             lines.append(f"  ... 还有 {len(stats['failed']) - 30} 个")
@@ -115,6 +119,7 @@ def build_summary(stats: dict, total: int) -> str:
 
 
 def run_account(idx: int, bduss: str, stoken: str) -> str:
+    """处理单个账号，返回报告文本。"""
     header = f"【账号 {idx + 1}】"
     logger.info(f"========== {header} 开始 ==========")
     try:
@@ -139,6 +144,7 @@ def run_account(idx: int, bduss: str, stoken: str) -> str:
 
 
 def send_wxpusher(content: str) -> bool:
+    """通过 WxPusher 推送签到报告。"""
     if not WXPUSHER_TOKEN or not WXPUSHER_UID:
         logger.warning("未配置 WXPUSHER_TOKEN / WXPUSHER_UID，跳过推送")
         return False
@@ -148,8 +154,8 @@ def send_wxpusher(content: str) -> bool:
             json={
                 "appToken": WXPUSHER_TOKEN,
                 "content": content,
-                "summary": "贴吧签到结果",   # 通知栏摘要
-                "contentType": 1,            # 1 = 纯文本
+                "summary": "贴吧签到结果",
+                "contentType": 1,
                 "uids": [WXPUSHER_UID],
             },
             timeout=15,
