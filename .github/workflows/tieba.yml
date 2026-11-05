@@ -2,8 +2,13 @@ name: Daily Tieba Sign-In
 
 on:
   workflow_dispatch:
+    inputs:
+      test_limit:
+        description: '调试用: 每账号只签前 N 个吧（留空 = 全量）'
+        required: false
+        default: ''
   schedule:
-    - cron: '30 22 * * *'  # UTC 22:30 = 北京时间次日 06:30
+    - cron: '0 21 * * *'  # UTC 21:00 = 北京时间次日 05:00
 
 jobs:
   signin:
@@ -27,6 +32,7 @@ jobs:
           STOKEN: ${{ secrets.STOKEN }}
           WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          TEST_LIMIT: ${{ github.event.inputs.test_limit }}
         run: python run.py
 
   workflow-keepalive:
