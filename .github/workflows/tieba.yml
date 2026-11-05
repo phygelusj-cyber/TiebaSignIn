@@ -25,7 +25,8 @@ jobs:
         env:
           BDUSS: ${{ secrets.BDUSS }}
           STOKEN: ${{ secrets.STOKEN }}
-          SCKEY: ${{ secrets.SCKEY }}
+          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
         run: python run.py
 
   workflow-keepalive:
