@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""百度贴吧自动签到 - GitHub Actions 入口
+"""百度贴吧自动签到 - 多账号 + WxPusher 推送
 
-用法:
-    python run.py                          # 自动读取环境变量 BDUSS / STOKEN / SCKEY
-    python run.py --bduss "your_bduss"     # 命令行传入 BDUSS
-    python run.py --bduss "x" --stoken "y" # 同时传入 STOKEN（web 兜底）
+环境变量:
+    BDUSS           多账号用 # 分隔
+    STOKEN          多账号用 # 分隔（与 BDUSS 顺序一一对应，可留空）
+    WXPUSHER_TOKEN  WxPusher 的 APP_TOKEN（ATP 开头）
+    WXPUSHER_UID    WxPusher 的 UID（UID_ 开头）
 """
 
-import argparse
 import logging
 import os
 import random
 import time
-from typing import Callable, Optional
 
 import requests
 from tieba_client import TiebaClient, best_result
@@ -24,73 +23,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+WXPUSHER_TOKEN = os.environ.get("WXPUSHER_TOKEN", "").strip()
+WXPUSHER_UID = os.environ.get("WXPUSHER_UID", "").strip()
 
-def default_sleeper(event: str, idx: int, total: int) -> None:
-    """默认节流/等待策略。
+MAX_ROUNDS = 5
 
-    event:
-        "step"  - 单个贴吧签到后的间隔
-        "round" - 重试轮次之间的间隔
+
+def slow_sleeper(event: str, idx: int, total: int) -> None:
+    """放慢版节流策略，防风控。
+    单吧间隔 3-5 秒，每 10 个吧歇 15-25 秒。
+    500 个吧约 40-50 分钟跑完，凌晨跑完全来得及。
     """
     if event == "step":
         if (idx + 1) % 10 == 0:
-            extra = random.uniform(5, 10)
+            extra = random.uniform(15, 25)
             logger.info(f"已签到 {idx + 1}/{total} 个，休息 {extra:.1f}s ...")
             time.sleep(extra)
         else:
-            time.sleep(random.uniform(1.0, 2.5))
+            time.sleep(random.uniform(3.0, 5.0))
     elif event == "round":
         wait = random.uniform(60, 90)
         logger.info(f"第 {idx + 1} 轮重试结束，等待 {wait:.1f}s 后继续...")
         time.sleep(wait)
 
 
-def parse_args() -> tuple[str, str]:
-    parser = argparse.ArgumentParser(description="百度贴吧自动签到")
-    parser.add_argument(
-        "--bduss",
-        default=None,
-        help="贴吧 BDUSS Cookie 值（优先级高于环境变量）",
-    )
-    parser.add_argument(
-        "--stoken",
-        default=None,
-        help="贴吧 STOKEN Cookie 值（优先级高于环境变量，用于 web 端兜底）",
-    )
-    args = parser.parse_args()
-
-    bduss = args.bduss or os.environ.get("BDUSS", "")
-    stoken = args.stoken or os.environ.get("STOKEN", "")
-    if not bduss:
-        parser.error("请通过 --bduss 参数或 BDUSS 环境变量提供 BDUSS")
-    return bduss, stoken
-
-
-def run_signin(
-    client: TiebaClient,
-    tbs: str,
-    forums: list[dict],
-    max_rounds: int = 5,
-    sleeper: Optional[Callable[[str, int, int], None]] = None,
-) -> dict:
-    """多轮签到主循环。
-
-    返回 stats:
-        {
-            "success": [成功贴吧名, ...],
-            "already": [已签到贴吧名, ...],
-            "failed":  [失败贴吧名, ...],
-        }
-    """
+def run_signin(client: TiebaClient, tbs: str, forums: list, max_rounds: int = MAX_ROUNDS,
+               sleeper=None) -> dict:
     if sleeper is None:
-        sleeper = default_sleeper
+        sleeper = slow_sleeper
 
     queue = list(forums)
     stats = {"success": [], "already": [], "failed": []}
 
     for round_idx in range(max_rounds):
         if round_idx > 0:
-            # 每轮重试前刷新 tbs（避免旧 tbs 导致 1989 等验证失败）
             new_tbs = client.get_tbs()
             if new_tbs is None:
                 logger.error("轮间刷新 tbs 失败，剩余贴吧全部标记失败")
@@ -99,9 +65,8 @@ def run_signin(
             tbs = new_tbs
             sleeper("round", round_idx, len(queue))
 
-        next_queue: list[dict] = []
+        next_queue = []
         for idx, forum in enumerate(queue):
-            # 同一轮内第一个贴吧不额外等待，后续贴吧按策略节流
             if round_idx > 0 or idx > 0:
                 sleeper("step", idx, len(queue))
 
@@ -122,7 +87,7 @@ def run_signin(
             elif result["status"] == "already":
                 logger.info(f"【{name}】{result['message']}")
                 stats["already"].append(name)
-            else:  # fatal
+            else:
                 logger.error(f"【{name}】签到失败: {result['message']}")
                 stats["failed"].append(name)
 
@@ -130,103 +95,91 @@ def run_signin(
         if not queue:
             break
 
-    # 超出最大轮次仍未成功的，全部计为失败
     stats["failed"].extend(f.get("name", "") for f in queue)
     return stats
 
 
-def send_pushplus(
-    token: str,
-    content: str,
-    logged_in: bool = True,
-    http: Optional[requests.Session] = None,
-) -> bool:
-    """通过 PushPlus 推送签到结果。
-
-    Args:
-        token: PushPlus token（即 README 中的 SCKEY）
-        content: 推送正文
-        logged_in: BDUSS 是否校验通过；False 时会在正文前追加未登录提示
-        http: 可选的 requests-like 对象，用于测试 mock
-    """
-    if not token:
-        return False
-
-    if not logged_in:
-        content = "【未登录】本次签到未能开始，请检查 BDUSS 是否有效。\n" + content
-
-    try:
-        payload = {
-            "token": token,
-            "title": "贴吧签到结果",
-            "content": content,
-            "template": "html",
-        }
-        client = http or requests
-        r = client.get("http://www.pushplus.plus/send", params=payload, timeout=10)
-        logger.info(f"PushPlus 响应: {r.text[:100]}")
-        return True
-    except Exception as e:
-        logger.error(f"PushPlus 推送失败: {e}")
-        return False
-
-
 def build_summary(stats: dict, total: int) -> str:
-    success = len(stats["success"])
-    already = len(stats["already"])
-    failed_count = len(stats["failed"])
-    failed_names = stats["failed"]
-
     lines = [
-        "========== 签到汇总 ==========",
         f"贴吧总数: {total}",
-        f"签到成功: {success}",
-        f"已经签到: {already}",
-        f"签到失败: {failed_count}",
-        "================================",
+        f"✅ 签到成功: {len(stats['success'])}",
+        f"⏭️ 已经签到: {len(stats['already'])}",
+        f"❌ 签到失败: {len(stats['failed'])}",
     ]
-
-    if failed_names:
-        lines.append("失败贴吧:")
-        lines.extend(f"  - {n}" for n in failed_names[:50])
-        if len(failed_names) > 50:
-            lines.append(f"  ... 还有 {len(failed_names) - 50} 个")
-
+    if stats["failed"]:
+        lines.append("失败贴吧（多为被封的吧）:")
+        lines.extend(f"  - {n}" for n in stats["failed"][:30])
+        if len(stats["failed"]) > 30:
+            lines.append(f"  ... 还有 {len(stats['failed']) - 30} 个")
     return "\n".join(lines)
 
 
+def run_account(idx: int, bduss: str, stoken: str) -> str:
+    header = f"【账号 {idx + 1}】"
+    logger.info(f"========== {header} 开始 ==========")
+    try:
+        client = TiebaClient(bduss, stoken=stoken)
+
+        tbs = client.get_tbs()
+        if not tbs:
+            logger.error(f"{header}获取 tbs 失败，BDUSS 可能失效")
+            return f"{header}\n⚠️ 获取 tbs 失败，BDUSS 可能失效，本次未签到。"
+
+        forums = client.get_favorites()
+        if not forums:
+            return f"{header}\n⚠️ 未获取到关注的贴吧。"
+
+        total = len(forums)
+        logger.info(f"{header}共 {total} 个贴吧，开始签到")
+        stats = run_signin(client, tbs, forums)
+        return f"{header}\n" + build_summary(stats, total)
+    except Exception as e:
+        logger.exception(f"{header}执行异常")
+        return f"{header}\n💥 执行异常: {e}"
+
+
+def send_wxpusher(content: str) -> bool:
+    if not WXPUSHER_TOKEN or not WXPUSHER_UID:
+        logger.warning("未配置 WXPUSHER_TOKEN / WXPUSHER_UID，跳过推送")
+        return False
+    try:
+        r = requests.post(
+            "https://wxpusher.zjiecode.com/api/send/message",
+            json={
+                "appToken": WXPUSHER_TOKEN,
+                "content": content,
+                "summary": "贴吧签到结果",   # 通知栏摘要
+                "contentType": 1,            # 1 = 纯文本
+                "uids": [WXPUSHER_UID],
+            },
+            timeout=15,
+        )
+        logger.info(f"WxPusher 响应: {r.text[:200]}")
+        return r.ok
+    except Exception as e:
+        logger.error(f"WxPusher 推送失败: {e}")
+        return False
+
+
 def main() -> None:
-    bduss, stoken = parse_args()
-    sckey = os.environ.get("SCKEY", "")
-    client = TiebaClient(bduss, stoken=stoken)
+    bdusses = [b.strip() for b in os.environ.get("BDUSS", "").split("#") if b.strip()]
+    stokens = [s.strip() for s in os.environ.get("STOKEN", "").split("#") if s.strip()]
+    if not bdusses:
+        raise SystemExit("未配置 BDUSS 环境变量")
 
-    # 1. 获取 tbs 并校验登录状态
-    logger.info("正在获取 tbs...")
-    tbs = client.get_tbs()
-    if not tbs:
-        logger.error("获取 tbs 失败，退出")
-        summary = "tbs 获取失败，本次签到未能开始。"
-        send_pushplus(sckey, summary, logged_in=client.logged_in)
-        raise SystemExit(1)
+    reports = []
+    for i, bduss in enumerate(bdusses):
+        stoken = stokens[i] if i < len(stokens) else ""
+        reports.append(run_account(i, bduss, stoken))
+        # 多账号之间多歇一会，避免两个账号同 IP 连续高频
+        if i < len(bdusses) - 1:
+            pause = random.uniform(30, 60)
+            logger.info(f"账号 {i + 1} 完成，休息 {pause:.0f}s 后处理下一个账号...")
+            time.sleep(pause)
 
-    # 2. 获取关注的贴吧列表
-    logger.info("正在获取关注的贴吧列表...")
-    forums = client.get_favorites()
-    if not forums:
-        logger.warning("未获取到关注的贴吧，签到结束")
-        summary = "未获取到关注的贴吧。"
-        send_pushplus(sckey, summary, logged_in=client.logged_in)
-        return
-
-    # 3. 多轮签到
-    total = len(forums)
-    logger.info(f"开始签到 {total} 个贴吧")
-    stats = run_signin(client, tbs, forums)
-
-    # 4. 汇总 + 推送
-    summary = build_summary(stats, total)
-    logger.info("\n" + summary)
-    send_pushplus(sckey, summary, logged_in=client.logged_in)
+    content = "📋 贴吧签到报告\n\n" + "\n\n".join(reports)
+    logger.info("\n" + content)
+    send_wxpusher(content)
 
 
 if __name__ == "__main__":
