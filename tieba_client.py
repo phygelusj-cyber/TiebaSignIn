@@ -33,7 +33,6 @@ BASE_SIGN_DATA = {
 }
 
 # ---------- status helpers ----------
-# 状态优先级：越小越好（success < already < retryable < fatal）
 STATUS_PRIORITY = {
     "success": 0,
     "already": 1,
@@ -185,8 +184,8 @@ class TiebaClient:
         返回状态:
             "success"   - 签到成功
             "already"   - 今日已签到
-            "retryable" - 临时失败，可重试（如 1102 / 1989 / 2150040）
-            "fatal"     - 不可重试失败（如 340006 / 2280007 / 540002 / 未知错误）
+            "retryable" - 临时失败，可在后续轮次重试
+            "fatal"     - 不可重试失败（如黑名单）
         """
         data = {**BASE_SIGN_DATA}
         data.update(
@@ -218,10 +217,14 @@ class TiebaClient:
         elif error_code in CLIENT_RETRYABLE_CODES:
             return {"status": "retryable", "rank": None, "message": error_msg or f"客户端错误 {error_code}"}
         else:
-            # 340006、2280007、540002 以及所有未知错误都视为 fatal
-            return {"status": "fatal", "rank": None, "message": error_msg or f"客户端错误 {error_code}"}
+            # [修改] 未知错误码不再一律判死：
+            # - 黑名单是明确无望的，保持 fatal，不浪费重试轮次
+            # - 其余（"签得太快"、"贴吧目录出问题" 等）一律 retryable，
+            #   交给后续轮次自动重签；5 轮后仍失败才计入失败名单
+            if "黑名单" in error_msg:
+                return {"status": "fatal", "rank": None, "message": error_msg or f"客户端错误 {error_code}"}
+            return {"status": "retryable", "rank": None, "message": error_msg or f"客户端错误 {error_code}"}
 
-    # -- web 端单个贴吧签到（兜底方案，需要 STOKEN） --
     def sign_forum_web(self, kw: str, tbs: str) -> dict:
         """
         web 端签到兜底。当客户端接口返回 retryable / 部分 fatal 时，
@@ -260,4 +263,5 @@ class TiebaClient:
         elif no_int in WEB_RETRYABLE_CODES:
             return {"status": "retryable", "rank": None, "message": error or f"web 需重试 {no_int}"}
         else:
-            return {"status": "fatal", "rank": None, "message": error or f"web 错误 {no_int}"}
+            # [修改] 同上：未知错误改为 retryable，进入后续轮次重签
+            return {"status": "retryable", "rank": None, "message": error or f"web 错误 {no_int}"}
