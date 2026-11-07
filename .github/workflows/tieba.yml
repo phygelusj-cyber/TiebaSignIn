@@ -8,7 +8,7 @@ on:
         required: false
         default: ''
   schedule:
-    - cron: '0 21 * * *'  # UTC 21:00 = 北京时间次日 05:00
+    - cron: '17 21 * * *'  # UTC 21:17 = 北京时间次日 05:17
 
 jobs:
   signin:
